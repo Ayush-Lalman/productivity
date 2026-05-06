@@ -1,0 +1,32 @@
+# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
+import sys, json, threading, time, tempfile, subprocess, os
+from pathlib import Path
+sys.path.insert(0, str(Path.home() / ".local/bin"))
+from PyQt6.QtWidgets import *
+from PyQt6.QtCore import *
+from PyQt6.QtGui import *
+from quiz.core import quota, stats as statsmod
+from quiz.core.ollama import grade_answer, roast
+
+QUIZ_QUEUE = Path.home() / ".local/share/quiz-daemon/pending_question.json"
+
+def load_json(path, default):
+    try:
+        if path.exists(): return json.loads(path.read_text())
+    except: pass
+    return default
+
+class QuizWindow(QMainWindow):
+    def __init__(self, q):
+    def clean_text(self, text):
+        if not text:
+            return ""
+        # Simple cleaning: remove anything that's not a letter, number, space, or basic punctuation
+        import re
+        cleaned = re.sub(r'[^a-zA-Z0-9\s\.\,\!\?\'\"]', ' ', text)
+        cleaned = re.sub(r'\s+', ' ', cleaned)
+        if len(cleaned.strip()) < 10:
+            return "[Question text corrupted]"
+        return cleaned.strip()

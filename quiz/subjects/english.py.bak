@@ -1,0 +1,165 @@
+import random, requests, io, fitz, pytesseract
+from PIL import Image
+from bs4 import BeautifulSoup
+from quiz.core import ollama as ai
+
+SUBJECT = "English"
+
+URLS = [
+    "https://stanmorephysics.com/english-grade-10-exam-papers/",
+    "https://stanmorephysics.com/english-grade-11/",
+    "https://stanmorephysics.com/englishgrade-12/",
+]
+
+SKIP_KEYWORDS = [
+    "FAL", "ATP", "SCOPE", "JIT", "STEP-AHEAD", "TEACHER", "LEARNER",
+    "GUIDELINES", "SUPPORT", "SOLUTIONS", "TIMETABLE", "POA",
+    "P2", "-P2-", "PAPER-2", "PAPER2"
+]
+
+WANT_PAPER = ["P1", "P3", "-1-", "-3-", "P1-", "P3-",
+              "PAPER-1", "PAPER-3", "MARCH", "SEPT", "NOV", "JUNE"]
+
+_paper_cache = {}
+
+def _is_wanted(href, text):
+    href_up  = href.upper()
+    text_up  = text.upper()
+    combined = href_up + " " + text_up
+    if not href.endswith('.pdf'):                  return False
+    if any(k in combined for k in SKIP_KEYWORDS): return False
+    if "FAL" in combined:                          return False
+    if not any(k in combined for k in WANT_PAPER): return False
+    return True
+
+def _fetch_pdf_links():
+    seen  = set()
+    links = []
+    for url in URLS:
+        try:
+            r    = requests.get(url, timeout=15)
+            soup = BeautifulSoup(r.text, 'html.parser')
+            for a in soup.find_all('a', href=True):
+                href = a['href']
+                text = a.text.strip()
+                if href in seen:               continue
+                if not _is_wanted(href, text): continue
+                seen.add(href)
+                links.append((text or href.split('/')[-1], href))
+        except Exception as e:
+            print(f"[english] fetch error {url}: {e}")
+    print(f"[english] found {len(links)} papers total")
+    return links
+
+def _extract_page_image(url, page_idx, prefix="quiz_visual_"):
+    """Render a specific PDF page to PNG and return the file path."""
+    import tempfile, fitz
+    try:
+        r = requests.get(url, timeout=20)
+        doc = fitz.open(stream=r.content, filetype="pdf")
+        if page_idx >= len(doc): return None
+        pix = doc[page_idx].get_pixmap(dpi=200)
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False, prefix=prefix)
+        pix.save(tmp.name)
+        return tmp.name
+    except Exception as e:
+        print(f"[english] image extract error: {e}")
+        return None
+
+def _ocr_pdf_bytes(data, max_pages=6):
+    chunks = []
+    try:
+        doc = fitz.open(stream=data, filetype='pdf')
+        for i, page in enumerate(doc):
+            if i >= max_pages: break
+            # try native text first
+            text = page.get_text().strip()
+            if len(text) < 50:
+                # fallback to preprocessed OCR
+                pix = page.get_pixmap(dpi=300)
+                img = Image.open(io.BytesIO(pix.tobytes('png')))
+                img = img.convert('L')
+                from PIL import ImageEnhance, ImageFilter
+                img = ImageEnhance.Contrast(img).enhance(2.0)
+                img = img.filter(ImageFilter.SHARPEN)
+                text = pytesseract.image_to_string(img, config='--psm 6')
+            words = text.split()
+            for j in range(0, len(words), 250):
+                chunk = " ".join(words[j:j+250])
+                if len(chunk.strip()) > 100:
+                    chunks.append(chunk)
+    except Exception as e:
+        print(f"OCR error: {e}")
+    return chunks
+
+def _get_paper_chunks(url):
+    if url in _paper_cache: return _paper_cache[url]
+    try:
+        r      = requests.get(url, timeout=20)
+        chunks = _ocr_pdf_bytes(r.content)
+        _paper_cache[url] = chunks
+        print(f"[english] {len(chunks)} chunks from {url.split('/')[-1]}")
+    except Exception as e:
+        print(f"[english] paper fetch error: {e}")
+        _paper_cache[url] = []
+    return _paper_cache[url]
+
+def get_question():
+    links = _fetch_pdf_links()
+    if not links:
+        print("[english] no papers found"); return None
+
+    label, url = random.choice(links)
+    is_p3      = "P3" in url.upper() or "P3" in label.upper()
+    paper_type = "Paper 3 (Writing)" if is_p3 else "Paper 1 (Language)"
+    print(f"[english] using: {label}")
+
+    chunks = _get_paper_chunks(url)
+    if not chunks:
+        print("[english] no chunks"); return None
+
+    anchor = random.choice(chunks)
+
+    VISUAL_TRIGGERS = ["visual", "advertis", "image", "picture", "cartoon",
+                       "poster", "photograph", "figure", "see below", "refer to",
+                       "table", "graph", "diagram"]
+    idx = chunks.index(anchor)
+    is_visual = any(t in anchor.lower() for t in VISUAL_TRIGGERS)
+    if is_visual:
+        neighbours = chunks[max(0,idx-1):min(len(chunks),idx+3)]
+        anchor = "\n---\n".join(neighbours)
+    # if visual page detected, also extract the actual page image
+    visual_image_path = None
+    if is_visual:
+        # estimate page index from chunk index (roughly chunk_size words per page)
+        est_page = max(0, idx // 3)
+        visual_image_path = _extract_page_image(url, est_page)
+
+
+    prompt = f"""You are a South African English Home Language exam question generator.
+
+The following is extracted from a real past exam paper — {paper_type} ({label}):
+\"\"\"
+{anchor[:1200]}
+\"\"\"
+
+Generate ONE English HL question appropriate for Grade 10–12 that:
+{"- Is a writing task: essay, transactional text, or creative writing prompt. MUST include a word count between 200-400 words in the question itself e.g. (Write approximately 250 words)" if is_p3 else "- Tests language in context: comprehension, summary, language structures, or visual text"}
+- Is clearly worded and could appear in a formal English HL assessment
+- Specifies what the student must do
+
+Respond ONLY in valid JSON, no markdown:
+{{"question": "...", "difficulty": "easy|medium|hard", "topic": "...", "section": "...", "answer": "..."}}"""
+
+    q = ai.generate_question(prompt)
+    if q:
+        if not is_p3:
+            q["passage"] = anchor[:1200]
+        else:
+            q["high_stakes"] = True
+        q["subject"] = SUBJECT
+        q["type"]    = "theory"
+        q["paper"]   = paper_type
+        if visual_image_path:
+            q["visual_image"] = visual_image_path
+    return q

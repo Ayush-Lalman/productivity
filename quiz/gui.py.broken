@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+import sys, json, threading, time, tempfile, subprocess, os, base64
+from pathlib import Path
+sys.path.insert(0, str(Path.home() / ".local/bin"))
+from PyQt6.QtWidgets import *
+from PyQt6.QtCore import *
+from PyQt6.QtGui import *
+from quiz.core import quota, stats as statsmod
+from quiz.core.ollama import grade_answer, roast
+from quiz.core.graph_utils import show_graph_for_question
+
+QUIZ_QUEUE = Path.home() / ".local/share/quiz-daemon/pending_question.json"
+
+def load_json(path, default):
+    try:
+        if path.exists(): return json.loads(path.read_text())
+    except: pass
+    return default
+
+def _env():
+    return {**os.environ, "DISPLAY": ":0",
+            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus"}
+
+def open_in_okular(text, prefix="quiz_"):
+    tmp = tempfile.NamedTemporaryFile(suffix='.txt', delete=False, prefix=prefix, mode='w')
+    tmp.write(text); tmp.close()
+    subprocess.Popen(["okular", tmp.name], env=_env())
+
+class QuizWindow(QMainWindow):
+    feedback_signal = pyqtSignal(str, str)
+
+    def __init__(self, q):
+        super().__init__()
+        self.q = q
+        self.time_left = q.get("time_limit", 600)
+        self.submitted = False
+        self._mcq_answer = None
+        self.feedback_signal.connect(self.show_feedback)
+        self.setWindowTitle("📚 Quiz")
+        # self.auto_copy_question()
+        self.setMinimumSize(720, 540)
+        self.setStyleSheet("""
+            QMainWindow,QWidget{background:#1e1e2e;color:#cdd6f4;font-family:'Noto Sans';}
+            QLabel#title{font-size:16px;font-weight:bold;color:#cba6f7;}
+            QLabel#meta{font-size:11px;color:#6c7086;}
+            QLabel#qtext{font-size:13px;color:#cdd6f4;padding:12px;background:#313244;border-radius:8px;}
+            QLabel#timer{font-size:22px;font-weight:bold;color:#a6e3a1;}
+            QTextEdit{background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:6px;font-size:13px;padding:8px;}
+            QPushButton#submit{background:#cba6f7;color:#1e1e2e;border-radius:6px;font-size:14px;font-weight:bold;padding:10px 20px;}
+            QPushButton#submit:hover{background:#b4befe;}
+            QPushButton#report{background:#313244;color:#cdd6f4;border-radius:6px;font-size:12px;padding:8px 14px;}
+            QLabel#feedback{font-size:13px;padding:12px;border-radius:8px;background:#313244;}
+            QPushButton#mcq{background:#313244;color:#cdd6f4;border:1px solid #45475a;border-radius:6px;font-size:15px;font-weight:bold;padding:12px 24px;}
+            QPushButton#mcq:hover{background:#45475a;border-color:#cba6f7;color:#cba6f7;}
+            QPushButton#mcq_selected{background:#45475a;color:#cba6f7;border:2px solid #cba6f7;border-radius:6px;font-size:15px;font-weight:bold;padding:12px 24px;}
+        """)
+        c = QWidget(); self.setCentralWidget(c)
+        lay = QVBoxLayout(c); lay.setSpacing(12); lay.setContentsMargins(20,20,20,20)
+
+        # header
+        hdr = QHBoxLayout()
+        lbl = QLabel(f"{q.get('subject')} — {q.get('topic','')}"); lbl.setObjectName("title")
+        hdr.addWidget(lbl); hdr.addStretch()
+        self.timer_lbl = QLabel(self._fmt(self.time_left)); self.timer_lbl.setObjectName("timer")
+        hdr.addWidget(self.timer_lbl); lay.addLayout(hdr)
+
+        meta_parts = [q.get('section',''), q.get('difficulty','?').upper(),
+                      'Practical' if q.get('type')=='practical' else 'Theory']
+        if q.get('paper'): meta_parts.append(q['paper'])
+        if q.get('grade'): meta_parts.append(q['grade'])
+        meta = QLabel("  |  ".join(p for p in meta_parts if p))
+        meta.setObjectName("meta"); lay.addWidget(meta)
+
+        # passage — open in okular (only if not multiple choice)
+        if q.get("passage") and not q.get("options"):
+            threading.Thread(target=open_in_okular, args=(q["passage"], "quiz_passage_"), daemon=True).start()
+            pl = QLabel("📄 Passage opened in Okular")
+            pl.setObjectName("meta"); lay.addWidget(pl)
+
+        # question
+        from quiz.core.format_utils import clean_text
+        ql = QLabel(clean_text(q.get("question","No question"))); ql.setObjectName("qtext")
+        ql.setWordWrap(True); lay.addWidget(ql)
+
+        # answer input area
+        if q.get("options") and len(str(q.get("options"))) > 500:
+            # MCQ handling (existing code)
+            self.mcq_lbl = QLabel("Select your answer:")
+            self.mcq_lbl.setStyleSheet("color:#cdd6f4;font-size:13px;")
+            lay.addWidget(self.mcq_lbl)
+            self.mcq_btns = {}
+            btn_row = QHBoxLayout()
+            for key in ["A", "B", "C", "D"]:
+                if key in q.get("options", {}):
+                    btn = QPushButton(key)
+                    btn.setObjectName("mcq")
+                    btn.setFixedSize(70, 70)
+                    btn.clicked.connect(lambda _, k=key: self._select_mcq(k))
+                    btn_row.addWidget(btn)
+                    self.mcq_btns[key] = btn
+            btn_row.addStretch()
+            lay.addLayout(btn_row)
+            self.ans = QTextEdit()
+            self.ans.hide()
+        elif q.get("type") == "drawing":
+            # Drawing question
+            from quiz.core.drawing_canvas import DrawingWindow
+            self.drawing_window = DrawingWindow(q.get("question", "Draw your answer"))
+            self.drawing_window.show()
+            self.drawing_window.submit_btn.clicked.connect(self.on_drawing_submitted)
+            self.ans = QTextEdit()
+            self.ans.setPlaceholderText("Describe your drawing here or paste text...")
+            self.ans.hide()
+        else:
+            # Text answer
+            self.ans = QTextEdit()
+            self.ans.setPlaceholderText("Type your answer here...")
+            lay.addWidget(self.ans)
+            self.wc_lbl = QLabel("Words: 0")
+            self.wc_lbl.setStyleSheet("color:#6c7086;font-size:11px;")
+            self.ans.textChanged.connect(self._update_wc)
+            lay.addWidget(self.wc_lbl)
+            self.mcq_btns = {}
+
+        # buttons
+        btns = QHBoxLayout()
+        rb = QPushButton("📊 Report"); rb.setObjectName("report"); rb.clicked.connect(self.show_report)
+        btns.addWidget(rb); btns.addStretch()
+        self.sub_btn = QPushButton("Submit"); self.sub_btn.setObjectName("submit")
+        btns.insertWidget(1, copy_btn)
+        self.sub_btn.clicked.connect(self.submit)
+        btns.addWidget(self.sub_btn)
+        lay.addLayout(btns)
+
+        # Add paste button if we have a text area
+        if hasattr(self, 'ans') and self.ans:
+            btns.insertWidget(1, paste_btn)
+
+        self.fb = QLabel(""); self.fb.setObjectName("feedback")
+        self.fb.setWordWrap(True); self.fb.hide(); lay.addWidget(self.fb)
+
+        t = QTimer(self); t.timeout.connect(self._tick); t.start(1000)
+        self._timer = t
+
+        if not q.get("options"):
+            threading.Thread(target=show_graph_for_question, args=(q,), daemon=True).start()
+
+    def _fmt(self, s): return f"{s//60}:{s%60:02d}"
+
+    def _tick(self):
+        if self.submitted: return
+        self.time_left -= 1
+        self.timer_lbl.setText(self._fmt(self.time_left))
+        if self.time_left <= 30:
+            self.timer_lbl.setStyleSheet("color:#f38ba8;font-size:22px;font-weight:bold;")
+        if self.time_left <= 0: self.submit(timed_out=True)
+
+    def _select_mcq(self, key):
+        self._mcq_answer = key
+        for k, btn in self.mcq_btns.items():
+            btn.setObjectName("mcq_selected" if k == key else "mcq")
+            btn.style().unpolish(btn); btn.style().polish(btn)
+
+    def _update_wc(self):
+        text = self.ans.toPlainText().strip()
+        words = len(text.split()) if text else 0
+        self.wc_lbl.setText(f"Words: {words}")
+
+        if self.submitted: return
+        self.submitted = True; self._timer.stop(); self.sub_btn.setEnabled(False)
+        answer = self._mcq_answer or self.ans.toPlainText().strip()
+        blank = not answer or timed_out
+        if blank:
+            quota.blank()
+            statsmod.record_result(self.q.get("subject"), self.q.get("topic",""), self.q.get("section",""), False, True)
+            threading.Thread(target=self._roast, daemon=True).start()
+        else:
+            threading.Thread(target=self._grade, args=(answer,), daemon=True).start()
+
+    def _grade(self, answer):
+        q = self.q
+        result = grade_answer(
+            question=q.get("question"),
+            answer=answer,
+            correct_answer=q.get("answer"),
+            expected_keywords=q.get("expected_keywords"),
+            practical=q.get("type") == "practical"
+        )
+        correct = result.get("correct", False)
+        partial = result.get("partial", False)
+        fb = result.get("feedback", "")
+        subject = q.get("subject","").lower()
+        partial_subjects = ["physics", "maths", "it", "accounting"]
+        allow_partial = any(s in subject for s in partial_subjects)
+        if correct:
+            quota.correct()
+            statsmod.record_result(q.get("subject"), q.get("topic",""), q.get("section",""), True, False)
+            self.feedback_signal.emit(f"✅ {fb}", "#a6e3a1")
+        elif partial and allow_partial:
+            statsmod.record_result(q.get("subject"), q.get("topic",""), q.get("section",""), False, False)
+            self.feedback_signal.emit(f"⚠ PART MARKS — correct method, wrong answer. {fb}", "#f9e2af")
+        else:
+            quota.wrong()
+            statsmod.record_result(q.get("subject"), q.get("topic",""), q.get("section",""), False, False)
+            self.feedback_signal.emit(f"❌ {fb}", "#f38ba8")
+
+    def _roast(self):
+        r = roast(self.q.get("question",""))
+        self.feedback_signal.emit(f"💀 {r}", "#fab387")
+
+    def show_feedback(self, text, color):
+        self.fb.setText(text)
+        self.fb.setStyleSheet(f"background:#313244;color:{color};padding:12px;border-radius:8px;font-size:13px;")
+        self.fb.show()
+
+    def closeEvent(self, event):
+        if not self.submitted:
+            quota.blank()
+            statsmod.record_result(self.q.get("subject"), self.q.get("topic",""), self.q.get("section",""), False, True)
+        event.accept()
+
+    def show_report(self):
+        self._rw = ReportWindow(); self._rw.show()
+
+class ReportWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("📊 Performance Report")
+        # self.auto_copy_question()
+        self.setMinimumSize(820, 600)
+        self.setStyleSheet("""
+            QMainWindow,QWidget{background:#1e1e2e;color:#cdd6f4;font-family:'Noto Sans';}
+            QTabWidget::pane{border:1px solid #45475a;}
+            QTabBar::tab{background:#313244;color:#cdd6f4;padding:8px 16px;}
+            QTabBar::tab:selected{background:#cba6f7;color:#1e1e2e;}
+            QTableWidget{background:#313244;gridline-color:#45475a;}
+            QHeaderView::section{background:#45475a;color:#cdd6f4;padding:6px;}
+        """)
+        c = QWidget(); self.setCentralWidget(c)
+        lay = QVBoxLayout(c); lay.setContentsMargins(16,16,16,16)
+        tabs = QTabWidget()
+        tabs.addTab(self._siyavula_tab(), "Maths / Physics (Siyavula)")
+        tabs.addTab(self._quiz_tab(), "Quiz Results")
+        lay.addWidget(tabs)
+
+    def _make_table(self, headers):
+        t = QTableWidget(); t.setColumnCount(len(headers))
+        t.setHorizontalHeaderLabels(headers)
+        t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        t.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        return t
+
+    def _siyavula_tab(self):
+        w = QWidget(); lay = QVBoxLayout(w)
+        data = statsmod.get_siyavula_stats()
+        if not data:
+            lay.addWidget(QLabel("No Siyavula data yet.")); return w
+        t = self._make_table(["Topic", "Section", "✓", "✗", "Accuracy"])
+        rows = []
+        for v in data.values():
+            total = v["correct"] + v["wrong"]
+            acc = v["correct"] / total if total else 0
+            rows.append((v["topic"], v["section"], v["correct"], v["wrong"], acc))
+        rows.sort(key=lambda x: x[4])
+        t.setRowCount(len(rows))
+        for i, (topic, section, c, w2, acc) in enumerate(rows):
+            t.setItem(i,0,QTableWidgetItem(topic))
+            t.setItem(i,1,QTableWidgetItem(section))
+            t.setItem(i,2,QTableWidgetItem(str(c)))
+            t.setItem(i,3,QTableWidgetItem(str(w2)))
+            ai = QTableWidgetItem(f"{acc:.0%}")
+            ai.setForeground(QColor("#a6e3a1" if acc>=0.7 else "#f9e2af" if acc>=0.4 else "#f38ba8"))
+            t.setItem(i,4,ai)
+        lay.addWidget(t); return w
+
+    def _quiz_tab(self):
+        w = QWidget(); lay = QVBoxLayout(w)
+        data = statsmod.get_quiz_stats()
+        if not data:
+            lay.addWidget(QLabel("No quiz data yet.")); return w
+        t = self._make_table(["Subject","Topic","Section","✓","✗","Blank","Accuracy"])
+        rows = list(data.values())
+        t.setRowCount(len(rows))
+        for i, v in enumerate(rows):
+            total = v.get("correct",0) + v.get("wrong",0)
+            acc = v.get("correct",0) / total if total else 0
+            t.setItem(i,0,QTableWidgetItem(v.get("subject","")))
+            t.setItem(i,1,QTableWidgetItem(v.get("topic","")))
+            t.setItem(i,2,QTableWidgetItem(v.get("section","")))
+            t.setItem(i,3,QTableWidgetItem(str(v.get("correct",0))))
+            t.setItem(i,4,QTableWidgetItem(str(v.get("wrong",0))))
+            t.setItem(i,5,QTableWidgetItem(str(v.get("blank",0))))
+            ai = QTableWidgetItem(f"{acc:.0%}")
+            ai.setForeground(QColor("#a6e3a1" if acc>=0.7 else "#f9e2af" if acc>=0.4 else "#f38ba8"))
+            t.setItem(i,6,ai)
+        lay.addWidget(t); return w
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    q = load_json(QUIZ_QUEUE, None)
+    if not q: print("No pending question"); sys.exit(0)
+    win = QuizWindow(q); win.show()
+    sys.exit(app.exec())
+
+    def copy_question_to_clipboard(self):
+        """Copy the question text to clipboard automatically"""
+        question_text = self.q.get("question", "No question")
+        
+        # Also copy the subject and topic for context
+        subject = self.q.get("subject", "")
+        topic = self.q.get("topic", "")
+        full_text = f"Subject: {subject} - {topic}\n\nQuestion: {question_text}"
+        
+        clipboard = QApplication.clipboard()
+        clipboard.setText(full_text)
+        
+        # Visual feedback
+        self.fb.setText("📋 Question copied to clipboard!")
+        self.fb.setStyleSheet("background:#313244;color:#a6e3a1;padding:8px;border-radius:6px;")
+        self.fb.show()
+        QTimer.singleShot(2000, self.fb.hide)
+        
+        print(f"📋 Copied to clipboard: {subject} - {topic}")
+
+    def auto_copy_question(self):
+        """Automatically copy question when window opens"""
+        QTimer.singleShot(500, self.copy_question_to_clipboard)
+
+    def auto_copy_question(self):
+        """Automatically copy question when window opens"""
+        QTimer.singleShot(500, self.copy_question_to_clipboard)
+
+        """Manually copy question to text file and clipboard"""
+        try:
+            # Get question details
+            subject = self.q.get("subject", "Unknown")
+            topic = self.q.get("topic", "Unknown")
+            question = self.q.get("question", "No question")
+            
+            # Format the text
+            full_text = f"Subject: {subject} - {topic}\n\nQuestion: {question}\n\n---\n"
+            
+            # Save to text file
+            log_file = Path.home() / ".local/share/quiz-daemon/copied_question.txt"
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_file, 'w') as f:
+                f.write(full_text)
+            
+            # Also copy to clipboard using xclip
+            import subprocess
+            subprocess.run(["xclip", "-selection", "clipboard", "-i"], input=full_text.encode(), check=False)
+            
+            # Show feedback
+            self.fb.setText("📋 Question copied to clipboard and saved to file!")
+            self.fb.setStyleSheet("background:#313244;color:#a6e3a1;padding:8px;border-radius:6px;")
+            self.fb.show()
+            QTimer.singleShot(3000, self.fb.hide)
+            
+            print(f"✅ Copied to: {log_file}")
+        except Exception as e:
+            print(f"Copy error: {e}")
+            self.fb.setText("❌ Copy failed!")
+            self.fb.show()
+            QTimer.singleShot(2000, self.fb.hide)
+
+        """Select all text in the answer field and question label"""
+        # Select all in answer field
+        if hasattr(self, 'ans'):
+            self.ans.selectAll()
+            self.ans.setFocus()
+        # Also copy question to clipboard as backup
+        question = self.q.get("question", "No question")
+        clipboard = QApplication.clipboard()
+        clipboard.setText(question)
+        self.fb.setText("📋 Question copied! Answer field selected.")
+        self.fb.setStyleSheet("background:#313244;color:#a6e3a1;padding:8px;border-radius:6px;")
+        self.fb.show()
+        QTimer.singleShot(2000, self.fb.hide)
