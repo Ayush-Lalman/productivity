@@ -1,0 +1,4 @@
+
+# Ignore timestamped backup folders
+bin/202*
+bin/20*
